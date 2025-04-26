@@ -1,28 +1,113 @@
-# app.py - BitNet Streamlit 소설 생성기 (토큰 청크 분할 & 계속 생성 지원)
+# app.py - 사용자 업로드 소설 학습 & 스타일 재생성 Streamlit 앱
 import os
-import subprocess
-import streamlit as st
+import torch
 import multiprocessing
-from threading import Thread
+import streamlit as st
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    Trainer,
+    TrainingArguments,
+    TextDataset,
+    DataCollatorForLanguageModeling
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_int8_training
 
 # 최대 CPU 스레드 사용
 NUM_THREADS = multiprocessing.cpu_count()
+torch.set_num_threads(NUM_THREADS)
 
-st.set_page_config(page_title="BitNet Novel Generator", layout="wide")
-st.title("🚀 BitNet 기반 소설 생성기")
+def fine_tune(model_name, train_file, output_dir, epochs, batch_size):
+    # LoRA를 이용한 미세조정
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        load_in_8bit=False,  # CPU에서는 False
+        device_map={"": "cpu"}
+    )
+    model = prepare_model_for_int8_training(model)
+    peft_config = LoraConfig(
+        r=8,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+    model = get_peft_model(model, peft_config)
 
-# 초기 환경 설정: bitnet.cpp 빌드
-if not os.path.isdir("bitnet.cpp"):
-    with st.spinner("BitNet 환경 설정 중..."):
-        subprocess.run(["bash", "setup_env.sh"], check=True)
+    dataset = TextDataset(
+        tokenizer=tokenizer,
+        file_path=train_file,
+        block_size=512
+    )
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False
+    )
+    args = TrainingArguments(
+        output_dir=output_dir,
+        per_device_train_batch_size=batch_size,
+        num_train_epochs=epochs,
+        logging_steps=50,
+        save_steps=200,
+        save_total_limit=1,
+        fp16=False,
+        dataloader_num_workers=NUM_THREADS
+    )
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=dataset,
+        data_collator=collator
+    )
+    trainer.train()
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
 
-# 사용자 입력 영역
-prompt = st.text_area("소설 시작 문장 입력", height=150)
-length = st.selectbox("출력 길이", ["단편(128)", "중편(512)", "장편(1024)"])
-length_map = {"단편(128)": 128, "중편(512)": 512, "장편(1024)": 1024}
-total_tokens = length_map[length]
-# 청크 크기 설정 (사이드바)
-chunk_size = st.sidebar.number_input("청크 크기(토큰)", value=128, step=64, min_value=32)
+
+def generate_chunk(model_dir, prompt, n_tokens, temperature=0.8):
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(model_dir, device_map={"": "cpu"})
+    inputs = tokenizer(prompt, return_tensors='pt')
+    generated = model.generate(
+        **inputs,
+        max_new_tokens=n_tokens,
+        do_sample=True,
+        temperature=temperature,
+        top_p=0.9,
+        top_k=50
+    )
+    return tokenizer.decode(generated[0], skip_special_tokens=True)
+
+# Streamlit 레이아웃
+st.set_page_config(page_title="Fine-Tune Novel Generator", layout="wide")
+st.title("📚 스타일 기반 소설 생성기")
+
+# 1) 학습 파트
+st.sidebar.header("1. 소설 학습")
+uploaded = st.sidebar.file_uploader("학습할 소설(.txt) 업로드", type="txt")
+model_name = st.sidebar.text_input("기본 모델명", value="mistralai/Mistral-7B-Instruct")
+epochs = st.sidebar.number_input("Epochs", min_value=1, max_value=5, value=3)
+batch_size = st.sidebar.number_input("Batch size", min_value=1, max_value=4, value=1)
+output_dir = st.sidebar.text_input("출력 디렉토리", value="./fine-tuned-model")
+if uploaded:
+    train_path = os.path.join(".", "train.txt")
+    with open(train_path, "wb") as f:
+        f.write(uploaded.getbuffer())
+    st.sidebar.success("업로드 완료")
+    if st.sidebar.button("학습 시작"):
+        with st.spinner("모델 학습 중... (시간이 오래 걸릴 수 있습니다) 🌱"):
+            fine_tune(model_name, train_path, output_dir, epochs, batch_size)
+        st.sidebar.success("학습 완료! 🎉")
+        st.balloons()
+
+# 2) 생성 파트
+st.header("2. 소설 생성")
+prompt = st.text_area("소설 시작 문장 또는 줄거리 입력", height=150)
+length_opt = st.selectbox("원하는 길이", ["단편(128)", "중편(512)", "장편(1024)"])
+total_tokens = int(length_opt.split("(")[1].strip(")"))
+chunk_size = st.number_input("청크 크기(토큰)", value=128, step=64, min_value=32)
 
 # 세션 상태 초기화
 if 'generated_text' not in st.session_state:
@@ -30,45 +115,32 @@ if 'generated_text' not in st.session_state:
 if 'tokens_generated' not in st.session_state:
     st.session_state.tokens_generated = 0
 
-# 출력 컨테이너
-output = st.empty().container()
+output_box = st.empty()
 
-# 청크 단위 생성 함수
-def run_chunk(n_tokens, input_text):
-    cmd = [
-        "python", "bitnet.cpp/run_inference.py",
-        "-m", "models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf",
-        "-p", input_text,
-        "-n", str(n_tokens),
-        "-t", str(NUM_THREADS),
-        "-temp", "0.8"
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    out = ""
-    for line in proc.stdout:
-        out += line
-    proc.wait()
-    return out
-
-# "생성 시작" 버튼: 초기 청크 생성
+# 생성 시작
 if st.button("생성 시작"):
     st.session_state.generated_text = ""
     st.session_state.tokens_generated = 0
+    # 사용자가 학습했다면 output_dir로, 아니면 기본 모델
+    model_dir = output_dir if os.path.isdir(output_dir) else model_name
+    # 첫 청크
     n = min(chunk_size, total_tokens)
-    result = run_chunk(n, prompt)
-    st.session_state.generated_text += result
-    st.session_state.tokens_generated += n
+    result = generate_chunk(model_dir, prompt, n)
+    st.session_state.generated_text = result
+    st.session_state.tokens_generated = n
 
-# "계속 생성" 버튼: 남은 토큰 생성
+# 계속 생성
 if st.session_state.tokens_generated < total_tokens:
     if st.button("계속 생성"):
+        model_dir = output_dir if os.path.isdir(output_dir) else model_name
         remaining = total_tokens - st.session_state.tokens_generated
         n = min(chunk_size, remaining)
-        result = run_chunk(n, st.session_state.generated_text)
+        result = generate_chunk(model_dir, st.session_state.generated_text, n)
         st.session_state.generated_text += result
         st.session_state.tokens_generated += n
 
 # 결과 표시
-with output:
-    st.markdown("### 생성된 소설")
-    st.write(st.session_state.generated_text)
+if st.session_state.generated_text:
+    output_box.markdown("### 생성된 소설")
+    output_box.write(st.session_state.generated_text)
+
